@@ -20,15 +20,15 @@ import {
 const fadeUp = {
   initial: { opacity: 0, y: 14 },
   animate: { opacity: 1, y: 0 },
-  transition: { duration: 0.45, ease: "easeOut" },
+  transition: { duration: 0.45, ease: [0.22, 1, 0.36, 1] as const },
 };
 
 const capabilityCards = [
   {
     icon: Sparkles,
-    title: "Nova 2 Omni reasoning",
+    title: "Amazon Nova reasoning",
     description:
-      "Single-pass, cross-modal intelligence correlating audio, visual, and text cues.",
+      "Multi-market video review across frames and visible on-screen text in one pass.",
   },
   {
     icon: ShieldCheck,
@@ -52,8 +52,8 @@ const workflow = [
   },
   {
     icon: AudioLines,
-    title: "Cross-modal reasoning",
-    description: "Nova 2 Omni correlates audio, visuals, and text in one pass.",
+    title: "Nova review pass",
+    description: "Amazon Nova checks visuals and visible text against market rules.",
   },
   {
     icon: LayoutGrid,
@@ -137,11 +137,11 @@ export default function LandingPage() {
           </Link>
         </nav>
 
-        <section className="grid gap-12 lg:grid-cols-[1.05fr_0.95fr] lg:items-center">
+        <section className="grid gap-10 lg:grid-cols-[0.95fr_1.05fr] lg:items-start lg:gap-8">
           <motion.div {...fadeUp} className="flex flex-col gap-6">
             <div className="inline-flex w-fit items-center gap-2 rounded-full border border-indigo-100 bg-white/80 px-4 py-1 text-xs font-semibold text-[#2F3CFF] shadow-sm">
               <Radar className="h-3.5 w-3.5" />
-              Nova 2 Omni reasoning layer
+              Amazon Nova review layer
             </div>
             <h1 className="font-display text-4xl font-semibold leading-tight text-slate-900 md:text-5xl">
               Reel Audit
@@ -265,8 +265,8 @@ export default function LandingPage() {
               One AI pass across audio, visual, and text.
             </h2>
             <p className="mt-3 text-sm text-slate-600">
-              Nova 2 Omni correlates audio, visual frames, dialogue, and on-screen text
-              simultaneously, flagging cross-modal conflicts that single-modal tools miss.
+              Amazon Nova reviews visual frames and visible on-screen text for each
+              selected market, surfacing violations and recommended edits in a single pass.
             </p>
           </motion.div>
         </section>
@@ -340,7 +340,7 @@ export default function LandingPage() {
             </h2>
             <div className="mt-5 grid gap-3 text-sm text-slate-600">
               <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-4 py-3">
-                <span>Nova 2 Omni (Bedrock)</span>
+                <span>Amazon Nova (Bedrock)</span>
                 <span className="font-semibold text-slate-900">Reasoning Core</span>
               </div>
               <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-4 py-3">

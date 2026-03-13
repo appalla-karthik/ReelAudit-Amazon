@@ -15,62 +15,22 @@ import {
   Timer,
 } from "lucide-react";
 
+import type { ComplianceAnalysisResponse, ComplianceViolation } from "@/lib/reelaudit-types";
+
 type ViewState = "upload" | "processing" | "review";
-
-type Violation = {
-  id: string;
-  market: string;
-  modality: "Visual" | "Audio" | "Cross-Modal";
-  start_time: number;
-  end_time: number;
-  display_time: string;
-  issue: string;
-  suggestion: string;
-};
-
-const MOCK_VIOLATIONS: Violation[] = [
-  {
-    id: "v1",
-    market: "UAE",
-    modality: "Visual",
-    start_time: 12.5,
-    end_time: 15.0,
-    display_time: "00:12",
-    issue: "Alcohol consumption visible on screen.",
-    suggestion: "Apply blur to the glass or cut scene.",
-  },
-  {
-    id: "v2",
-    market: "Germany",
-    modality: "Cross-Modal",
-    start_time: 45.0,
-    end_time: 48.5,
-    display_time: "00:45",
-    issue: "Audio implies violence while visual shows restricted symbols.",
-    suggestion: "Requires full scene removal for region.",
-  },
-  {
-    id: "v3",
-    market: "USA",
-    modality: "Audio",
-    start_time: 82.0,
-    end_time: 84.0,
-    display_time: "01:22",
-    issue: "Explicit language detected in background dialogue.",
-    suggestion: "Bleep or mute audio track segment.",
-  },
-];
 
 const MARKETS = ["UAE", "Germany", "USA", "India", "South Korea", "Brazil"];
 
 const PROCESSING_STEPS = [
-  "Extracting Audio...",
-  "Analyzing Visual Frames...",
-  "Checking Cross-Modal Context...",
-  "Comparing against regional rulesets...",
+  "Uploading secure review copy to S3...",
+  "Scanning frames and visible on-screen text...",
+  "Comparing scenes against selected market rules...",
+  "Normalizing findings for timeline review...",
 ];
 
-const modalityStyles: Record<Violation["modality"], string> = {
+const EASE_OUT = [0.22, 1, 0.36, 1] as const;
+
+const modalityStyles: Record<ComplianceViolation["modality"], string> = {
   Visual: "bg-rose-100 text-rose-700",
   Audio: "bg-amber-100 text-amber-700",
   "Cross-Modal": "bg-indigo-100 text-indigo-700",
@@ -93,6 +53,15 @@ const formatFileSize = (bytes: number) => {
   return `${(mb / 1024).toFixed(1)} GB`;
 };
 
+async function getResponseError(response: Response) {
+  try {
+    const payload = (await response.json()) as { error?: string };
+    return payload.error || "We couldn't complete the Nova analysis.";
+  } catch {
+    return "We couldn't complete the Nova analysis.";
+  }
+}
+
 export default function DashboardPage() {
   const [view, setView] = useState<ViewState>("upload");
   const [file, setFile] = useState<File | null>(null);
@@ -105,9 +74,11 @@ export default function DashboardPage() {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [phaseIndex, setPhaseIndex] = useState(0);
-  const [processingKey, setProcessingKey] = useState(0);
   const [duration, setDuration] = useState(0);
   const [activeViolationId, setActiveViolationId] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [analysis, setAnalysis] = useState<ComplianceAnalysisResponse | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -116,52 +87,93 @@ export default function DashboardPage() {
       setVideoUrl(null);
       return;
     }
+
     const url = URL.createObjectURL(file);
     setVideoUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [file]);
 
   useEffect(() => {
-    if (view !== "processing") return;
+    if (view !== "processing" || !isAnalyzing) return;
+
     setPhaseIndex(0);
-    setProcessingKey((prev) => prev + 1);
     const stepInterval = setInterval(() => {
-      setPhaseIndex((prev) => (prev + 1) % PROCESSING_STEPS.length);
-    }, 700);
-    const processingTimeout = setTimeout(() => {
-      setView("review");
-    }, 3600);
+      setPhaseIndex((prev) => Math.min(prev + 1, PROCESSING_STEPS.length - 1));
+    }, 1100);
+
     return () => {
       clearInterval(stepInterval);
-      clearTimeout(processingTimeout);
     };
-  }, [view]);
+  }, [view, isAnalyzing]);
 
   const visibleViolations = useMemo(
-    () => MOCK_VIOLATIONS.filter((violation) => selectedMarkets.includes(violation.market)),
-    [selectedMarkets]
+    () => (analysis?.violations ?? []).filter((violation) => selectedMarkets.includes(violation.market)),
+    [analysis, selectedMarkets]
   );
 
   useEffect(() => {
-    if (view !== "review" || visibleViolations.length === 0) return;
-    setActiveViolationId((prev) => prev ?? visibleViolations[0].id);
+    if (view !== "review") return;
+
+    setActiveViolationId((prev) =>
+      visibleViolations.some((violation) => violation.id === prev)
+        ? prev
+        : (visibleViolations[0]?.id ?? null)
+    );
   }, [view, visibleViolations]);
 
-  const complianceScore = Math.max(82, 100 - visibleViolations.length * 6);
-  const timelineDuration = duration || 120;
-  const canAnalyze = Boolean(file) && selectedMarkets.length > 0;
+  const complianceScore = analysis?.complianceScore ?? 0;
+  const timelineDuration =
+    duration || Math.max(120, ...visibleViolations.map((violation) => violation.end_time));
+  const canAnalyze = Boolean(file) && selectedMarkets.length > 0 && !isAnalyzing;
+  const processingProgress = Math.min(28 + phaseIndex * 22, 94);
 
   const handleFile = (nextFile: File | null) => {
     if (!nextFile) return;
+
+    setAnalysis(null);
+    setAnalysisError(null);
+    setActiveViolationId(null);
+    setDuration(0);
     setFile(nextFile);
   };
 
-  const handleAnalyze = () => {
-    if (!canAnalyze) return;
+  const handleAnalyze = async () => {
+    if (!canAnalyze || !file) return;
+
+    setAnalysis(null);
+    setAnalysisError(null);
+    setActiveViolationId(null);
+    setIsAnalyzing(true);
     setView("processing");
+
+    const formData = new FormData();
+    formData.append("video", file);
+    formData.append("markets", JSON.stringify(selectedMarkets));
+
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(await getResponseError(response));
+      }
+
+      const payload = (await response.json()) as ComplianceAnalysisResponse;
+      setAnalysis(payload);
+      setView("review");
+    } catch (error) {
+      setView("upload");
+      setAnalysisError(
+        error instanceof Error ? error.message : "We couldn't complete the Nova analysis."
+      );
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
-  const handleViolationClick = (violation: Violation) => {
+  const handleViolationClick = (violation: ComplianceViolation) => {
     setActiveViolationId(violation.id);
     if (videoRef.current) {
       videoRef.current.currentTime = violation.start_time;
@@ -175,7 +187,12 @@ export default function DashboardPage() {
   const handleReset = () => {
     setView("upload");
     setFile(null);
+    setAnalysis(null);
+    setAnalysisError(null);
+    setDuration(0);
     setActiveViolationId(null);
+    setDropdownOpen(false);
+    setIsAnalyzing(false);
   };
 
   const toggleMarket = (market: string) => {
@@ -204,7 +221,7 @@ export default function DashboardPage() {
                 Global AI Video Compliance Engine
               </h1>
               <p className="text-sm text-slate-500">
-                Command Center - Nova 2 Omni-ready compliance intelligence
+                Command Center - Amazon Nova + S3 review workflow
               </p>
             </div>
           </div>
@@ -225,12 +242,24 @@ export default function DashboardPage() {
                 New Upload
               </button>
             ) : (
-              <div className="rounded-full border border-slate-200 bg-white/80 px-4 py-2 text-xs font-medium text-slate-500 shadow-sm">
-                Mock analysis mode
+              <div className="rounded-full border border-emerald-100 bg-emerald-50 px-4 py-2 text-xs font-medium text-emerald-700 shadow-sm">
+                Live Bedrock + S3 mode
               </div>
             )}
           </div>
         </header>
+
+        {analysisError && (
+          <div className="rounded-[24px] border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-700 shadow-sm">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div>
+                <p className="font-semibold">Analysis could not finish</p>
+                <p className="mt-1 text-rose-600">{analysisError}</p>
+              </div>
+            </div>
+          </div>
+        )}
 
         <AnimatePresence mode="wait">
           {view === "upload" && (
@@ -270,7 +299,8 @@ export default function DashboardPage() {
                         Drag and drop your video asset
                       </h2>
                       <p className="mt-2 text-sm text-slate-500">
-                        Upload a Creative Commons film or internal asset for multi-market analysis.
+                        Upload a local video and Reel Audit will send it to S3, then run Amazon Nova
+                        across the markets you select.
                       </p>
                     </div>
                     <button
@@ -279,7 +309,9 @@ export default function DashboardPage() {
                     >
                       Browse files
                     </button>
-                    <p className="text-xs text-slate-400">MP4, MOV, WEBM up to 1GB</p>
+                    <p className="text-xs text-slate-400">
+                      MP4, MOV, WEBM up to 100 MB in the live API flow
+                    </p>
                     <input
                       ref={inputRef}
                       type="file"
@@ -308,7 +340,7 @@ export default function DashboardPage() {
                     <div>
                       <p className="text-sm font-semibold text-slate-900">Target Markets</p>
                       <p className="text-xs text-slate-500">
-                        Choose jurisdictions for compliance analysis.
+                        Choose jurisdictions for the live compliance pass.
                       </p>
                     </div>
                   </div>
@@ -372,29 +404,32 @@ export default function DashboardPage() {
                       <Timer className="h-5 w-5" />
                     </div>
                     <div>
-                      <p className="text-sm font-semibold text-slate-900">Nova 2 Omni Pipeline</p>
+                      <p className="text-sm font-semibold text-slate-900">Amazon Nova Pipeline</p>
                       <p className="text-xs text-slate-500">
-                        Single-pass cross-modal reasoning with per-market rules.
+                        Live S3 upload plus market-by-market visual review in Bedrock.
                       </p>
                     </div>
                   </div>
                   <div className="mt-4 grid grid-cols-2 gap-3 text-xs text-slate-500">
                     <div className="rounded-xl bg-slate-50 px-3 py-3">
-                      <p className="font-semibold text-slate-900">3.4s</p>
-                      <p>Estimated runtime</p>
+                      <p className="font-semibold text-slate-900">Live</p>
+                      <p>S3-backed upload flow</p>
                     </div>
                     <div className="rounded-xl bg-slate-50 px-3 py-3">
-                      <p className="font-semibold text-slate-900">Multi-modal</p>
-                      <p>Audio + Visual + Text</p>
+                      <p className="font-semibold text-slate-900">Video + Text</p>
+                      <p>Frames and visible copy</p>
                     </div>
                     <div className="rounded-xl bg-slate-50 px-3 py-3">
-                      <p className="font-semibold text-slate-900">5 regions</p>
-                      <p>Rulesets active</p>
+                      <p className="font-semibold text-slate-900">{selectedMarkets.length} regions</p>
+                      <p>Rulesets loaded on request</p>
                     </div>
                     <div className="rounded-xl bg-slate-50 px-3 py-3">
-                      <p className="font-semibold text-slate-900">Bedrock-ready</p>
-                      <p>API plug-in later</p>
+                      <p className="font-semibold text-slate-900">AWS profile</p>
+                      <p>Uses your local credentials</p>
                     </div>
+                  </div>
+                  <div className="mt-4 rounded-2xl border border-amber-100 bg-amber-50 px-4 py-3 text-xs text-amber-700">
+                    Audio-only violations are intentionally disabled in this first live integration.
                   </div>
                 </div>
 
@@ -409,7 +444,7 @@ export default function DashboardPage() {
                   }`}
                 >
                   <Sparkles className="h-4 w-4" />
-                  Analyze Compliance
+                  {isAnalyzing ? "Analyzing..." : "Analyze Compliance"}
                 </button>
               </div>
             </motion.section>
@@ -431,10 +466,10 @@ export default function DashboardPage() {
                   </div>
                   <div>
                     <p className="text-sm font-semibold text-slate-900">
-                      Nova 2 Omni is processing your video
+                      Amazon Nova is processing your video
                     </p>
                     <p className="text-xs text-slate-500">
-                      Multi-modal reasoning in progress across {selectedMarkets.length} markets.
+                      Bedrock is reviewing {selectedMarkets.length} selected markets now.
                     </p>
                   </div>
                 </div>
@@ -456,10 +491,8 @@ export default function DashboardPage() {
 
                 <div className="mt-6 h-2 w-full overflow-hidden rounded-full bg-slate-100">
                   <motion.div
-                    key={processingKey}
-                    initial={{ width: "0%" }}
-                    animate={{ width: "100%" }}
-                    transition={{ duration: 3.6, ease: "easeInOut" }}
+                    animate={{ width: `${processingProgress}%` }}
+                    transition={{ duration: 0.45, ease: EASE_OUT }}
                     className="h-full rounded-full bg-[#2F3CFF]"
                   />
                 </div>
@@ -483,7 +516,7 @@ export default function DashboardPage() {
             </motion.section>
           )}
 
-          {view === "review" && (
+          {view === "review" && analysis && (
             <motion.section
               key="review"
               initial={{ opacity: 0, y: 10 }}
@@ -499,7 +532,7 @@ export default function DashboardPage() {
                   </p>
                   <p className="mt-2 text-3xl font-semibold text-slate-900">{complianceScore}%</p>
                   <p className="mt-1 text-sm text-slate-500">
-                    Across {selectedMarkets.length} markets
+                    Across {analysis.selectedMarkets.length} markets
                   </p>
                 </div>
                 <div className="rounded-[24px] border border-slate-200 bg-white/90 p-5 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.5)] backdrop-blur">
@@ -510,7 +543,7 @@ export default function DashboardPage() {
                     {visibleViolations.length}
                   </p>
                   <p className="mt-1 text-sm text-slate-500">
-                    Auto-flagged with suggested edits
+                    Normalized from the Nova response
                   </p>
                 </div>
                 <div className="rounded-[24px] border border-slate-200 bg-white/90 p-5 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.5)] backdrop-blur">
@@ -519,17 +552,30 @@ export default function DashboardPage() {
                   </p>
                   <div className="mt-2 flex items-center gap-2 text-emerald-600">
                     <CheckCircle2 className="h-5 w-5" />
-                    <span className="text-lg font-semibold">Ready for action</span>
+                    <span className="text-lg font-semibold">
+                      {visibleViolations.length > 0 ? "Review recommended" : "Clear on selected rules"}
+                    </span>
                   </div>
-                  <p className="mt-1 text-sm text-slate-500">
-                    Click a violation to jump to scene.
-                  </p>
+                  <p className="mt-1 text-sm text-slate-500">{analysis.summary}</p>
                 </div>
               </div>
 
+              {analysis.warnings.length > 0 && (
+                <div className="rounded-[24px] border border-amber-100 bg-amber-50 px-5 py-4 text-sm text-amber-700 shadow-sm">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <div className="space-y-1">
+                      {analysis.warnings.map((warning) => (
+                        <p key={warning}>{warning}</p>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
                 <div className="rounded-[32px] border border-slate-200 bg-white/90 p-6 shadow-[0_25px_70px_-45px_rgba(15,23,42,0.6)] backdrop-blur">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-4">
                     <div>
                       <h2 className="text-lg font-semibold text-slate-900">Media Viewer</h2>
                       <p className="text-xs text-slate-500">
@@ -593,6 +639,20 @@ export default function DashboardPage() {
                       <span>{formatTime(timelineDuration)}</span>
                     </div>
                   </div>
+
+                  <details className="mt-4 rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                    <summary className="cursor-pointer list-none font-semibold text-slate-500 marker:hidden">
+                      Technical details
+                    </summary>
+                    <div className="mt-3 grid gap-2 text-[11px] leading-relaxed text-slate-500">
+                      <div>
+                        <span className="font-semibold text-slate-600">Model:</span> {analysis.modelId}
+                      </div>
+                      <div className="break-all">
+                        <span className="font-semibold text-slate-600">S3 source:</span> {analysis.s3Uri}
+                      </div>
+                    </div>
+                  </details>
                 </div>
 
                 <div className="flex flex-col rounded-[32px] border border-slate-200 bg-white/90 p-6 shadow-[0_25px_70px_-45px_rgba(15,23,42,0.6)] backdrop-blur">
@@ -623,7 +683,7 @@ export default function DashboardPage() {
                               : "border-slate-200 bg-white hover:border-indigo-200"
                           }`}
                         >
-                          <div className="flex items-center justify-between">
+                          <div className="flex items-center justify-between gap-3">
                             <span className="text-xs font-semibold uppercase tracking-wide text-[#2F3CFF]">
                               {violation.market}
                             </span>
@@ -641,7 +701,7 @@ export default function DashboardPage() {
                             </span>
                             <span className="flex items-center gap-1 text-xs text-rose-500">
                               <AlertTriangle className="h-3 w-3" />
-                              Flagged
+                              {Math.round(violation.confidence * 100)}% confidence
                             </span>
                           </div>
                           <p className="mt-3 text-sm text-slate-700">{violation.issue}</p>
@@ -655,10 +715,10 @@ export default function DashboardPage() {
                       <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-200 px-4 py-10 text-center">
                         <CheckCircle2 className="h-8 w-8 text-emerald-500" />
                         <p className="mt-3 text-sm font-semibold text-slate-900">
-                          No violations detected
+                          No clear violations detected
                         </p>
                         <p className="text-xs text-slate-500">
-                          Adjust selected markets or upload a different asset.
+                          Nova did not find strong evidence against the selected market rules.
                         </p>
                       </div>
                     )}
