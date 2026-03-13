@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -9,12 +9,16 @@ import {
   CheckCircle2,
   ChevronDown,
   CloudUpload,
+  Download,
   PlayCircle,
   ShieldCheck,
   Sparkles,
   Timer,
+  Wand2,
 } from "lucide-react";
 
+import { generateComplianceDraft } from "@/lib/reelaudit-autofix";
+import { createChunkPlan } from "@/lib/reelaudit-pipeline";
 import type { ComplianceAnalysisResponse, ComplianceViolation } from "@/lib/reelaudit-types";
 
 type ViewState = "upload" | "processing" | "review";
@@ -36,6 +40,17 @@ const modalityStyles: Record<ComplianceViolation["modality"], string> = {
   "Cross-Modal": "bg-indigo-100 text-indigo-700",
 };
 
+const strategyLabels: Record<ComplianceViolation["editPlan"]["strategy"], string> = {
+  blur: "Blur",
+  mask: "Mask",
+  crop: "Crop",
+  replace: "Replace",
+  disclaimer: "Disclaimer",
+  mute: "Mute",
+  trim: "Trim",
+  "manual-review": "Manual review",
+};
+
 const formatTime = (seconds: number) => {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
   const minutes = Math.floor(seconds / 60);
@@ -51,6 +66,14 @@ const formatFileSize = (bytes: number) => {
   const mb = kb / 1024;
   if (mb < 1024) return `${mb.toFixed(1)} MB`;
   return `${(mb / 1024).toFixed(1)} GB`;
+};
+
+const getAspectRatio = (width: number, height: number) => {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+
+  return width / height;
 };
 
 async function getResponseError(response: Response) {
@@ -75,23 +98,64 @@ export default function DashboardPage() {
   const [isDragging, setIsDragging] = useState(false);
   const [phaseIndex, setPhaseIndex] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [sourceDuration, setSourceDuration] = useState<number | null>(null);
+  const [videoAspectRatio, setVideoAspectRatio] = useState<number | null>(null);
   const [activeViolationId, setActiveViolationId] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<ComplianceAnalysisResponse | null>(null);
+  const [draftUrl, setDraftUrl] = useState<string | null>(null);
+  const [draftFileName, setDraftFileName] = useState<string | null>(null);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [draftProgress, setDraftProgress] = useState(0);
+  const [isGeneratingDraft, setIsGeneratingDraft] = useState(false);
+  const [previewMode, setPreviewMode] = useState<"original" | "draft">("original");
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!file) {
       setVideoUrl(null);
+      setSourceDuration(null);
+      setVideoAspectRatio(null);
       return;
     }
 
     const url = URL.createObjectURL(file);
     setVideoUrl(url);
-    return () => URL.revokeObjectURL(url);
+
+    const probe = document.createElement("video");
+    probe.preload = "metadata";
+
+    const handleLoadedMetadata = () => {
+      setSourceDuration(Number.isFinite(probe.duration) ? probe.duration : null);
+      setVideoAspectRatio(getAspectRatio(probe.videoWidth, probe.videoHeight));
+    };
+
+    const handleMetadataError = () => {
+      setSourceDuration(null);
+      setVideoAspectRatio(null);
+    };
+
+    probe.addEventListener("loadedmetadata", handleLoadedMetadata);
+    probe.addEventListener("error", handleMetadataError);
+    probe.src = url;
+
+    return () => {
+      probe.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      probe.removeEventListener("error", handleMetadataError);
+      probe.src = "";
+      URL.revokeObjectURL(url);
+    };
   }, [file]);
+
+  useEffect(() => {
+    return () => {
+      if (draftUrl) {
+        URL.revokeObjectURL(draftUrl);
+      }
+    };
+  }, [draftUrl]);
 
   useEffect(() => {
     if (view !== "processing" || !isAnalyzing) return;
@@ -123,17 +187,62 @@ export default function DashboardPage() {
 
   const complianceScore = analysis?.complianceScore ?? 0;
   const timelineDuration =
-    duration || Math.max(120, ...visibleViolations.map((violation) => violation.end_time));
+    duration || sourceDuration || Math.max(120, ...visibleViolations.map((violation) => violation.end_time));
   const canAnalyze = Boolean(file) && selectedMarkets.length > 0 && !isAnalyzing;
   const processingProgress = Math.min(28 + phaseIndex * 22, 94);
+  const uploadPlan = useMemo(() => createChunkPlan(sourceDuration), [sourceDuration]);
+  const currentScope = analysis?.scope ?? uploadPlan.scope;
+  const currentChunks = analysis?.chunks ?? uploadPlan.chunks;
+  const canGenerateDraft = Boolean(file) && visibleViolations.length > 0 && !isGeneratingDraft;
+  const activeVideoUrl = previewMode === "draft" && draftUrl ? draftUrl : videoUrl;
+  const previewFrameStyle = useMemo<CSSProperties>(() => {
+    const ratio = videoAspectRatio ?? 16 / 9;
+
+    if (ratio < 0.9) {
+      return {
+        aspectRatio: `${ratio}`,
+        width: "min(100%, 420px)",
+      };
+    }
+
+    if (ratio < 1.3) {
+      return {
+        aspectRatio: `${ratio}`,
+        width: "min(100%, 640px)",
+      };
+    }
+
+    return {
+      aspectRatio: `${ratio}`,
+      width: "100%",
+    };
+  }, [videoAspectRatio]);
+
+  useEffect(() => {
+    if (!videoRef.current) {
+      return;
+    }
+
+    videoRef.current.currentTime = 0;
+  }, [activeVideoUrl]);
 
   const handleFile = (nextFile: File | null) => {
     if (!nextFile) return;
 
+    if (draftUrl) {
+      URL.revokeObjectURL(draftUrl);
+    }
     setAnalysis(null);
     setAnalysisError(null);
+    setDraftError(null);
+    setDraftUrl(null);
+    setDraftFileName(null);
+    setDraftProgress(0);
+    setPreviewMode("original");
     setActiveViolationId(null);
     setDuration(0);
+    setSourceDuration(null);
+    setVideoAspectRatio(null);
     setFile(nextFile);
   };
 
@@ -142,6 +251,7 @@ export default function DashboardPage() {
 
     setAnalysis(null);
     setAnalysisError(null);
+    setDraftError(null);
     setActiveViolationId(null);
     setIsAnalyzing(true);
     setView("processing");
@@ -149,6 +259,9 @@ export default function DashboardPage() {
     const formData = new FormData();
     formData.append("video", file);
     formData.append("markets", JSON.stringify(selectedMarkets));
+    if (sourceDuration) {
+      formData.append("durationSeconds", String(sourceDuration));
+    }
 
     try {
       const response = await fetch("/api/analyze", {
@@ -162,6 +275,8 @@ export default function DashboardPage() {
 
       const payload = (await response.json()) as ComplianceAnalysisResponse;
       setAnalysis(payload);
+      setDraftError(null);
+      setPreviewMode("original");
       setView("review");
     } catch (error) {
       setView("upload");
@@ -184,12 +299,58 @@ export default function DashboardPage() {
     }
   };
 
+  const handleGenerateDraft = async () => {
+    if (!file || !visibleViolations.length || isGeneratingDraft) return;
+
+    if (draftUrl) {
+      URL.revokeObjectURL(draftUrl);
+    }
+
+    setDraftError(null);
+    setDraftUrl(null);
+    setDraftFileName(null);
+    setDraftProgress(0);
+    setIsGeneratingDraft(true);
+
+    try {
+      const result = await generateComplianceDraft({
+        file,
+        violations: visibleViolations,
+        onProgress: (progress) => setDraftProgress(Math.round(progress * 100)),
+      });
+
+      const nextDraftUrl = URL.createObjectURL(result.blob);
+      setDraftUrl(nextDraftUrl);
+      setDraftFileName(result.fileName);
+      setPreviewMode("draft");
+    } catch (error) {
+      setDraftError(
+        error instanceof Error
+          ? error.message
+          : "We couldn't generate the market-safe draft."
+      );
+      setPreviewMode("original");
+    } finally {
+      setIsGeneratingDraft(false);
+    }
+  };
+
   const handleReset = () => {
+    if (draftUrl) {
+      URL.revokeObjectURL(draftUrl);
+    }
     setView("upload");
     setFile(null);
     setAnalysis(null);
     setAnalysisError(null);
+    setDraftError(null);
+    setDraftUrl(null);
+    setDraftFileName(null);
+    setDraftProgress(0);
+    setPreviewMode("original");
     setDuration(0);
+    setSourceDuration(null);
+    setVideoAspectRatio(null);
     setActiveViolationId(null);
     setDropdownOpen(false);
     setIsAnalyzing(false);
@@ -424,12 +585,21 @@ export default function DashboardPage() {
                       <p>Rulesets loaded on request</p>
                     </div>
                     <div className="rounded-xl bg-slate-50 px-3 py-3">
-                      <p className="font-semibold text-slate-900">AWS profile</p>
-                      <p>Uses your local credentials</p>
+                      <p className="font-semibold text-slate-900">
+                        {currentScope.processingMode === "chunked-longform"
+                          ? `${currentScope.estimatedChunks} planned chunks`
+                          : "Single clip pass"}
+                      </p>
+                      <p>
+                        {sourceDuration
+                          ? `${formatTime(sourceDuration)} duration detected`
+                          : "Chunk plan appears after metadata loads"}
+                      </p>
                     </div>
                   </div>
                   <div className="mt-4 rounded-2xl border border-amber-100 bg-amber-50 px-4 py-3 text-xs text-amber-700">
                     Audio-only violations are intentionally disabled in this first live integration.
+                    Long-form production mode will split hours-long masters into overlap-safe chunk windows.
                   </div>
                 </div>
 
@@ -573,6 +743,143 @@ export default function DashboardPage() {
                 </div>
               )}
 
+              <div className="rounded-[24px] border border-slate-200 bg-white/90 p-5 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.5)] backdrop-blur">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                      Auto-Fix Draft
+                    </p>
+                    <h3 className="mt-1 text-lg font-semibold text-slate-900">
+                      Generate a market-safe preview automatically
+                    </h3>
+                    <p className="mt-1 text-sm text-slate-500">
+                      First version applies non-destructive disclaimer overlays on flagged
+                      timestamps so the scene can stay intact while your team reviews the edit plan.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      type="button"
+                      disabled={!canGenerateDraft}
+                      onClick={handleGenerateDraft}
+                      className={`inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition ${
+                        canGenerateDraft
+                          ? "bg-[#2F3CFF] text-white hover:bg-[#3c48ff]"
+                          : "cursor-not-allowed bg-slate-200 text-slate-400"
+                      }`}
+                    >
+                      <Wand2 className="h-4 w-4" />
+                      {isGeneratingDraft ? `Generating ${draftProgress}%` : "Create Safe Draft"}
+                    </button>
+                    {draftUrl && draftFileName && (
+                      <a
+                        href={draftUrl}
+                        download={draftFileName}
+                        className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-600 transition hover:border-indigo-200 hover:text-[#2F3CFF]"
+                      >
+                        <Download className="h-4 w-4" />
+                        Download Draft
+                      </a>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                  <div className="rounded-2xl bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                    <p className="font-semibold text-slate-900">Current fix mode</p>
+                    <p className="mt-1">Disclaimer overlay on each flagged time window</p>
+                  </div>
+                  <div className="rounded-2xl bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                    <p className="font-semibold text-slate-900">Scene handling</p>
+                    <p className="mt-1">Keeps the scene intact instead of cutting it immediately</p>
+                  </div>
+                  <div className="rounded-2xl bg-slate-50 px-4 py-3 text-xs text-slate-500">
+                    <p className="font-semibold text-slate-900">Next upgrade</p>
+                    <p className="mt-1">Blur, mask, and market-specific export jobs for long-form</p>
+                  </div>
+                </div>
+
+                {draftError && (
+                  <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                    {draftError}
+                  </div>
+                )}
+
+                {draftUrl && (
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setPreviewMode("original")}
+                      className={`rounded-full px-3 py-1.5 text-xs font-semibold transition ${
+                        previewMode === "original"
+                          ? "bg-slate-900 text-white"
+                          : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                      }`}
+                    >
+                      Original preview
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPreviewMode("draft")}
+                      className={`rounded-full px-3 py-1.5 text-xs font-semibold transition ${
+                        previewMode === "draft"
+                          ? "bg-emerald-600 text-white"
+                          : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                      }`}
+                    >
+                      Safe draft preview
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-[0.78fr_1.22fr]">
+                <div className="rounded-[24px] border border-slate-200 bg-white/90 p-5 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.5)] backdrop-blur">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                    Processing Mode
+                  </p>
+                  <p className="mt-2 text-xl font-semibold text-slate-900">
+                    {analysis.scope.processingMode === "chunked-longform"
+                      ? "Chunked long-form plan"
+                      : "Single-pass clip review"}
+                  </p>
+                  <p className="mt-1 text-sm text-slate-500">
+                    {analysis.scope.estimatedChunks} chunk windows · {analysis.scope.chunkWindowSeconds}s each
+                  </p>
+                  <p className="mt-3 text-xs text-slate-500">
+                    This is the path we use to scale from short clips today to hour-long masters in
+                    production without losing where the violation happened.
+                  </p>
+                </div>
+
+                <div className="rounded-[24px] border border-slate-200 bg-white/90 p-5 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.5)] backdrop-blur">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                        Chunk Plan
+                      </p>
+                      <p className="mt-1 text-sm text-slate-500">
+                        The same video can be expanded into chunk-level analysis for long-form review.
+                      </p>
+                    </div>
+                    <div className="rounded-full bg-[#eef0ff] px-3 py-1 text-xs font-semibold text-[#2F3CFF]">
+                      {analysis.chunks.length} chunks
+                    </div>
+                  </div>
+                  <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                    {currentChunks.slice(0, 6).map((chunk) => (
+                      <div
+                        key={chunk.id}
+                        className="rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3 text-xs text-slate-500"
+                      >
+                        <p className="font-semibold text-slate-900">{chunk.label}</p>
+                        <p className="mt-1">{chunk.display_time}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
               <div className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
                 <div className="rounded-[32px] border border-slate-200 bg-white/90 p-6 shadow-[0_25px_70px_-45px_rgba(15,23,42,0.6)] backdrop-blur">
                   <div className="flex items-center justify-between gap-4">
@@ -587,14 +894,31 @@ export default function DashboardPage() {
                     </div>
                   </div>
 
-                  <div className="mt-5 aspect-video overflow-hidden rounded-2xl bg-slate-900">
-                    {videoUrl ? (
+                  {draftUrl && (
+                    <div className="mt-4 inline-flex w-fit items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-600">
+                      Preview: {previewMode === "draft" ? "Safe draft" : "Original upload"}
+                    </div>
+                  )}
+
+                  <div
+                    className="mt-5 mx-auto overflow-hidden rounded-2xl bg-slate-900"
+                    style={previewFrameStyle}
+                  >
+                    {activeVideoUrl ? (
                       <video
                         ref={videoRef}
-                        src={videoUrl}
+                        src={activeVideoUrl}
                         controls
-                        className="h-full w-full object-cover"
-                        onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
+                        className="h-full w-full object-contain"
+                        onLoadedMetadata={(event) => {
+                          setDuration(event.currentTarget.duration);
+                          setVideoAspectRatio(
+                            getAspectRatio(
+                              event.currentTarget.videoWidth,
+                              event.currentTarget.videoHeight
+                            )
+                          );
+                        }}
                         onDurationChange={(event) => setDuration(event.currentTarget.duration)}
                       />
                     ) : (
@@ -703,11 +1027,38 @@ export default function DashboardPage() {
                               <AlertTriangle className="h-3 w-3" />
                               {Math.round(violation.confidence * 100)}% confidence
                             </span>
+                            <span className="rounded-full bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700">
+                              {strategyLabels[violation.editPlan.strategy]}
+                            </span>
+                            <span className="rounded-full bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-600">
+                              {violation.editPlan.preserveScene ? "Preserve scene" : "Regional cut"}
+                            </span>
                           </div>
+                          <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                            {violation.ruleFocus}
+                          </p>
                           <p className="mt-3 text-sm text-slate-700">{violation.issue}</p>
                           <p className="mt-2 text-xs text-slate-500">
                             Suggested action: {violation.suggestion}
                           </p>
+                          <div className="mt-3 rounded-xl bg-slate-50 px-3 py-3 text-xs text-slate-600">
+                            <p>
+                              <span className="font-semibold text-slate-900">Fix plan:</span>{" "}
+                              {violation.editPlan.editorNote}
+                            </p>
+                            <p className="mt-1">
+                              <span className="font-semibold text-slate-900">Safe alternative:</span>{" "}
+                              {violation.editPlan.safeAlternative}
+                            </p>
+                            <p className="mt-1">
+                              <span className="font-semibold text-slate-900">Target region:</span>{" "}
+                              {violation.editPlan.targetRegion}
+                            </p>
+                            <p className="mt-1">
+                              <span className="font-semibold text-slate-900">Automation:</span>{" "}
+                              {violation.editPlan.automationStatus}
+                            </p>
+                          </div>
                         </motion.button>
                       );
                     })}

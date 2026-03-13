@@ -10,6 +10,7 @@ export async function POST(request: Request) {
     const formData = await request.formData();
     const videoFile = formData.get("video");
     const rawMarkets = formData.get("markets");
+    const rawDurationSeconds = formData.get("durationSeconds");
 
     if (!(videoFile instanceof File)) {
       return NextResponse.json({ error: "A video file is required." }, { status: 400 });
@@ -32,6 +33,10 @@ export async function POST(request: Request) {
       contentType: videoFile.type || "video/mp4",
       fileName: videoFile.name || "upload.mp4",
       selectedMarkets,
+      durationSeconds:
+        typeof rawDurationSeconds === "string" && Number.isFinite(Number(rawDurationSeconds))
+          ? Number(rawDurationSeconds)
+          : null,
     });
 
     return NextResponse.json(analysis);
