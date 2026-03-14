@@ -103,7 +103,7 @@ export default function LandingPage() {
         </div>
       </div>
 
-      <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-24 px-6 py-10">
+      <div className="relative mx-auto flex w-full max-w-7xl flex-col gap-12 px-6 py-8 md:gap-16 md:py-10">
         <nav className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[#2F3CFF] text-white shadow-[0_10px_30px_-18px_rgba(47,60,255,0.9)]">

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Manrope, Space_Grotesk } from "next/font/google";
+import { AmazonNovaCursor } from "./amazon-nova-cursor";
 import "./globals.css";
 
 const spaceGrotesk = Space_Grotesk({
@@ -29,6 +30,7 @@ export default function RootLayout({
         suppressHydrationWarning
         className={`${spaceGrotesk.variable} ${manrope.variable} bg-[#F5F7FB] text-slate-900 antialiased`}
       >
+        <AmazonNovaCursor />
         {children}
       </body>
     </html>
